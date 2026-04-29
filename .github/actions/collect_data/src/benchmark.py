@@ -566,6 +566,10 @@ def _get_mapper(pipeline_project, report_data):
     mapper_cls = _REPORT_TYPE_MAPPERS.get((pipeline_project, report_type))
     if mapper_cls:
         return mapper_cls()
+    if "mean_ttft_ms" in report_data:
+        return VllmBenchmarkDataMapper()
+    if "metadata" in report_data and "args" in report_data:
+        return GuideLLMBenchmarkDataMapper()
     mapper_cls = _PROJECT_MAPPERS.get(pipeline_project)
     if mapper_cls:
         return mapper_cls()
