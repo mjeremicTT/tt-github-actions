@@ -6,6 +6,7 @@ import math
 import os
 import pathlib
 import json
+import re
 from loguru import logger
 from pydantic import ValidationError
 from pydantic_models import BenchmarkMeasurement, CompleteBenchmarkRun
@@ -50,7 +51,7 @@ def create_json_from_report(pipeline, workflow_outputs_dir) -> List[CompleteBenc
         for report_path in report_paths:
             with open(report_path) as report_file:
                 report_data = json.load(report_file)
-                benchmark_data = _map_benchmark_data(pipeline, job_id, report_data, model_spec_data)
+                benchmark_data = _map_benchmark_data(pipeline, job_id, report_data, model_spec_data, report_path)
                 if benchmark_data:
                     results.extend(benchmark_data)
                     logger.info(f"Created benchmark data for job: {job_id} from report: {report_path}")
@@ -62,6 +63,36 @@ def get_benchmark_filename(report) -> str:
     return f"benchmark_{report.github_pipeline_id}_{ts}.jsonl"
 
 
+def _extract_job_id(file_path: pathlib.Path, artifacts_dir: pathlib.Path) -> int | None:
+    """
+    Extracts the GitHub job ID associated with a report file.
+
+    By default we expect the report filename to be in format
+    `<report_name>_<job_id>.json`. For raw benchmark files under a
+    `benchmarks_output/` directory the filename does not carry the job ID, so we
+    fall back to the trailing integer of the top-level artifact directory name
+    (e.g. `report_..._c110_81036678347` -> 81036678347).
+    """
+    try:
+        rel_parts = file_path.relative_to(artifacts_dir).parts
+    except ValueError:
+        rel_parts = ()
+
+    if "benchmarks_output" in rel_parts and rel_parts:
+        artifact_dir_name = rel_parts[0]
+        try:
+            return int(artifact_dir_name.split("_")[-1])
+        except ValueError:
+            logger.warning(f"Could not extract job ID from artifact directory {artifact_dir_name}")
+            return None
+
+    try:
+        return int(file_path.name.split(".")[-2].split("_")[-1])
+    except ValueError:
+        logger.warning(f"Could not extract job ID from {file_path.name}")
+        return None
+
+
 def _get_model_reports(workflow_outputs_dir, workflow_run_id: int) -> Dict[int, List[pathlib.Path]]:
     """
     This function searches for perf reports in the artifacts directory
@@ -69,7 +100,7 @@ def _get_model_reports(workflow_outputs_dir, workflow_run_id: int) -> Dict[int, 
     We expect that report filename is in format `<report_name>_<job_id>.json`.
     """
     job_paths_map = {}
-    artifacts_dir = f"{workflow_outputs_dir}/{workflow_run_id}/artifacts"
+    artifacts_dir = pathlib.Path(f"{workflow_outputs_dir}/{workflow_run_id}/artifacts")
 
     logger.info(f"Searching for perf reports in {artifacts_dir}")
 
@@ -78,11 +109,8 @@ def _get_model_reports(workflow_outputs_dir, workflow_run_id: int) -> Dict[int, 
             if file.endswith(".json"):
                 logger.debug(f"Found perf report {file}")
                 file_path = pathlib.Path(root) / file
-                filename = file_path.name
-                try:
-                    job_id = int(filename.split(".")[-2].split("_")[-1])
-                except ValueError:
-                    logger.warning(f"Could not extract job ID from {filename}")
+                job_id = _extract_job_id(file_path, artifacts_dir)
+                if job_id is None:
                     continue
                 report_paths = job_paths_map.get(job_id, [])
                 report_paths.append(file_path)
@@ -832,6 +860,148 @@ class GuideLLMBenchmarkDataMapper(_BenchmarkDataMapper):
             return None
 
 
+class GuideLLMRawBenchmarkDataMapper(_BenchmarkDataMapper):
+    """
+    Maps raw per-run benchmark files emitted by tt-shield's benchmarks workflow
+    into the `workflow_logs/benchmarks_output/` directory.
+
+    Two flavours live side by side in that directory and both are handled here,
+    one CompleteBenchmarkRun per file:
+      * `benchmark_id_*.json`         - flat performance metrics (ttft/tpot/itl, throughput)
+      * `benchmark_structured_*.json` - same metrics plus structured-output correctness
+                                        (`correct_rate(%)`, `benchmark_kind: structured_output`)
+
+    These files carry no `report_type`; they are routed here by directory path.
+    """
+
+    MEASUREMENT_KEYS = [
+        "num_prompts",
+        "completed",
+        "failed",
+        "duration",
+        "total_input_tokens",
+        "total_output_tokens",
+        "request_throughput",
+        "request_goodput",
+        "output_throughput",
+        "total_token_throughput",
+        "max_output_tokens_per_s",
+        "max_concurrent_requests",
+        "mean_ttft_ms",
+        "median_ttft_ms",
+        "std_ttft_ms",
+        "p99_ttft_ms",
+        "mean_tpot_ms",
+        "median_tpot_ms",
+        "std_tpot_ms",
+        "p99_tpot_ms",
+        "mean_itl_ms",
+        "median_itl_ms",
+        "std_itl_ms",
+        "p99_itl_ms",
+        "mean_e2el_ms",
+        "median_e2el_ms",
+        "std_e2el_ms",
+        "p99_e2el_ms",
+        # Structured-output correctness (see _correct_rate)
+        "correct_rate",
+    ]
+
+    @staticmethod
+    def _parse_filename_dims(filename):
+        """
+        Parses benchmark dimensions encoded in the filename, e.g.
+        `..._isl-128_osl-1024_maxcon-16_n-64.json` or `..._dataset-json_osl-128_...`.
+        """
+        out = {}
+        if not isinstance(filename, str):
+            return out
+        stem = pathlib.Path(filename).stem
+        for token in stem.split("_"):
+            int_match = re.fullmatch(r"(isl|osl|maxcon|n)-(\d+)", token)
+            if int_match:
+                out[int_match.group(1)] = int(int_match.group(2))
+                continue
+            dataset_match = re.fullmatch(r"dataset-(.+)", token)
+            if dataset_match:
+                out["dataset"] = dataset_match.group(1)
+        return out
+
+    def map_benchmark_data(
+        self, pipeline, job_id, report_data, model_spec_data=None
+    ) -> List[CompleteBenchmarkRun] | None:
+        job = self._get_job(pipeline, job_id)
+        if job is None:
+            return None
+
+        try:
+            source_filename = report_data.get("source_filename")
+            dims = self._parse_filename_dims(source_filename)
+
+            benchmark_kind = report_data.get("benchmark_kind")
+            is_structured = benchmark_kind == "structured_output"
+            # Land alongside ShieldBenchmarkDataMapper._process_benchmarks; the
+            # structured-output flavour stays distinguishable via benchmark_kind
+            # in config_params.
+            run_type = "benchmark"
+
+            model_id = report_data.get("model_id") or ""
+            model_name = model_id.split("/", 1)[-1] if "/" in model_id else model_id
+
+            # Drop None values so optional metrics (e.g. request_goodput) are skipped
+            # silently rather than failing BenchmarkMeasurement's float validation.
+            metrics_data = {k: v for k, v in report_data.items() if v is not None}
+            correct_rate = report_data.get("correct_rate(%)")
+            if correct_rate is not None:
+                metrics_data["correct_rate"] = correct_rate
+
+            measurements = self._create_measurements(job, run_type, metrics_data, self.MEASUREMENT_KEYS)
+
+            outputs = report_data.get("outputs") or []
+            num_correct = sum(1 for o in outputs if isinstance(o, dict) and o.get("correctness"))
+
+            config_params = {
+                "model_id": model_id,
+                "tokenizer_id": report_data.get("tokenizer_id"),
+                "backend": report_data.get("backend"),
+                "endpoint_type": report_data.get("endpoint_type"),
+                "request_rate": report_data.get("request_rate"),
+                "burstiness": report_data.get("burstiness"),
+                "num_prompts": report_data.get("num_prompts"),
+                "max_concurrency": report_data.get("max_concurrency"),
+                "benchmark_kind": benchmark_kind,
+                "date": report_data.get("date"),
+                "source_filename": source_filename,
+            }
+            if is_structured or correct_rate is not None:
+                config_params["correct_rate"] = correct_rate
+                config_params["num_correct"] = num_correct
+                config_params["num_outputs"] = len(outputs)
+
+            return [
+                self._create_complete_benchmark_run(
+                    pipeline=pipeline,
+                    job=job,
+                    data=report_data,
+                    run_type=run_type,
+                    measurements=measurements,
+                    device_info=None,
+                    model_name=model_name,
+                    model_type=(model_spec_data or {}).get("model_type"),
+                    batch_size=report_data.get("max_concurrency") or dims.get("maxcon"),
+                    config_params=config_params,
+                    input_seq_length=dims.get("isl"),
+                    output_seq_length=dims.get("osl"),
+                    dataset_name=dims.get("dataset"),
+                    docker_image=(model_spec_data or {}).get("docker_image") or job.docker_image,
+                )
+            ]
+        except ValidationError as e:
+            failure_happened()
+            logger.error(f"Validation error: {e}")
+            return None
+
+
 _REPORT_TYPE_MAPPERS = {
     ("tt-shield", "vllm_bench_serve"): VllmBenchmarkDataMapper,
     ("tt-inference-server", "vllm_bench_serve"): VllmBenchmarkDataMapper,
@@ -849,7 +1019,11 @@ _PROJECT_MAPPERS = {
 }
 
 
-def _get_mapper(pipeline_project, report_data):
+def _get_mapper(pipeline_project, report_data, report_path=None):
+    # Raw benchmark files under benchmarks_output/ carry no report_type and are
+    # routed solely by their directory path.
+    if report_path is not None and "benchmarks_output" in pathlib.Path(report_path).parts:
+        return GuideLLMRawBenchmarkDataMapper()
     report_type = report_data.get("report_type")
     mapper_cls = _REPORT_TYPE_MAPPERS.get((pipeline_project, report_type))
     if mapper_cls:
@@ -860,6 +1034,8 @@ def _get_mapper(pipeline_project, report_data):
     raise ValueError(f"No mapper found for project {pipeline_project}!")
 
 
-def _map_benchmark_data(pipeline, job_id, report_data, model_spec_data=None):
-    mapper = _get_mapper(pipeline.project, report_data)
+def _map_benchmark_data(pipeline, job_id, report_data, model_spec_data=None, report_path=None):
+    mapper = _get_mapper(pipeline.project, report_data, report_path)
+    if report_path is not None:
+        report_data = {**report_data, "source_filename": pathlib.Path(report_path).name}
     return mapper.map_benchmark_data(pipeline, job_id, report_data, model_spec_data)
